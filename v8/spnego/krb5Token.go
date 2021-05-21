@@ -6,14 +6,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jcmturner/gofork/encoding/asn1"
 	"github.com/jcmturner/gokrb5/v8/asn1tools"
 	"github.com/jcmturner/gokrb5/v8/client"
-	"github.com/jcmturner/gokrb5/v8/credentials"
+	"github.com/jcmturner/gokrb5/v8/crypto"
 	"github.com/jcmturner/gokrb5/v8/gssapi"
+	"github.com/jcmturner/gokrb5/v8/iana"
+	"github.com/jcmturner/gokrb5/v8/iana/asnAppTag"
 	"github.com/jcmturner/gokrb5/v8/iana/chksumtype"
+	"github.com/jcmturner/gokrb5/v8/iana/keyusage"
 	"github.com/jcmturner/gokrb5/v8/iana/msgtype"
+	"github.com/jcmturner/gokrb5/v8/iana/nametype"
 	"github.com/jcmturner/gokrb5/v8/krberror"
 	"github.com/jcmturner/gokrb5/v8/messages"
 	"github.com/jcmturner/gokrb5/v8/service"
@@ -168,7 +173,7 @@ func NewKRB5TokenAPREQ(cl *client.Client, tkt messages.Ticket, sessionKey types.
 	tb, _ := hex.DecodeString(TOK_ID_KRB_AP_REQ)
 	m.tokID = tb
 
-	auth, err := krb5TokenAuthenticator(cl.Credentials, GSSAPIFlags)
+	auth, err := krb5TokenAuthenticator(cl, sessionKey, GSSAPIFlags)
 	if err != nil {
 		return m, err
 	}
@@ -188,31 +193,162 @@ func NewKRB5TokenAPREQ(cl *client.Client, tkt messages.Ticket, sessionKey types.
 }
 
 // krb5TokenAuthenticator creates a new kerberos authenticator for kerberos MechToken
-func krb5TokenAuthenticator(creds *credentials.Credentials, flags []int) (types.Authenticator, error) {
+func krb5TokenAuthenticator(cl *client.Client, sessionKey types.EncryptionKey, flags []int) (types.Authenticator, error) {
+	creds := cl.Credentials
+
 	//RFC 4121 Section 4.1.1
 	auth, err := types.NewAuthenticator(creds.Domain(), creds.CName())
 	if err != nil {
 		return auth, krberror.Errorf(err, krberror.KRBMsgError, "error generating new authenticator")
 	}
+
+	checksum, err := newAuthenticatorChksum(cl, sessionKey, flags)
+	if err != nil {
+		return auth, err
+	}
+
 	auth.Cksum = types.Checksum{
 		CksumType: chksumtype.GSSAPI,
-		Checksum:  newAuthenticatorChksum(flags),
+		Checksum:  checksum,
 	}
+
 	return auth, nil
 }
 
 // Create new authenticator checksum for kerberos MechToken
-func newAuthenticatorChksum(flags []int) []byte {
+func newAuthenticatorChksum(cl *client.Client, sessionKey types.EncryptionKey, flags []int) ([]byte, error) {
 	a := make([]byte, 24)
 	binary.LittleEndian.PutUint32(a[:4], 16)
 	for _, i := range flags {
 		if i == gssapi.ContextFlagDeleg {
-			x := make([]byte, 28-len(a))
-			a = append(a, x...)
+			deleg, err := credDeleg(cl, sessionKey)
+			if err != nil {
+				return nil, err
+			}
+
+			size := []byte{0, 0}
+			binary.LittleEndian.PutUint16(size, uint16(len(deleg)))
+
+			a = append(a, 0x01, 0x00, size[0], size[1])
+			a = append(a, deleg...)
 		}
+
 		f := binary.LittleEndian.Uint32(a[20:24])
 		f |= uint32(i)
 		binary.LittleEndian.PutUint32(a[20:24], f)
 	}
-	return a
+
+	return a, nil
+}
+
+type marshalKRBCred struct {
+	PVNO    int                 `asn1:"explicit,tag:0"`
+	MsgType int                 `asn1:"explicit,tag:1"`
+	Tickets []asn1.RawValue     `asn1:"explicit,tag:2"`
+	EncPart types.EncryptedData `asn1:"explicit,tag:3"`
+}
+
+type marshalEncKrbCredPart struct {
+	TicketInfo []marshalKrbCredInfo `asn1:"explicit,tag:0"`
+	Nouce      int                  `asn1:"optional,explicit,tag:1"`
+	Timestamp  time.Time            `asn1:"generalized,optional,explicit,tag:2"`
+	Usec       int                  `asn1:"optional,explicit,tag:3"`
+	SAddress   types.HostAddress    `asn1:"optional,explicit,tag:4"`
+	RAddress   types.HostAddress    `asn1:"optional,explicit,tag:5"`
+}
+
+type marshalKrbCredInfo struct {
+	Key       types.EncryptionKey `asn1:"explicit,tag:0"`
+	PRealm    string              `asn1:"generalstring,optional,explicit,tag:1"`
+	PName     types.PrincipalName `asn1:"optional,explicit,tag:2"`
+	Flags     asn1.BitString      `asn1:"optional,explicit,tag:3"`
+	AuthTime  time.Time           `asn1:"generalized,optional,explicit,tag:4"`
+	StartTime time.Time           `asn1:"generalized,optional,explicit,tag:5"`
+	EndTime   time.Time           `asn1:"generalized,optional,explicit,tag:6"`
+	RenewTill time.Time           `asn1:"generalized,optional,explicit,tag:7"`
+	SRealm    string              `asn1:"generalstring,optional,explicit,tag:8"`
+	SName     types.PrincipalName `asn1:"optional,explicit,tag:9"`
+	CAddr     types.HostAddresses `asn1:"optional,explicit,tag:10"`
+}
+
+func credDeleg(cl *client.Client, sessionKey types.EncryptionKey) ([]byte, error) {
+	realm := cl.Credentials.Domain()
+
+	spn := types.PrincipalName{
+		NameType: nametype.KRB_NT_SRV_INST,
+		NameString: []string{
+			"krbtgt",
+			realm,
+		},
+	}
+
+	tgt, skey, err := cl.GetServiceTicket(spn.PrincipalNameString())
+	if err != nil {
+		return nil, err
+	}
+
+	tgsReq, err := messages.NewTGSReq(cl.Credentials.CName(), realm, cl.Config, tgt, skey, spn, false)
+	if err != nil {
+		return nil, err
+	}
+
+	_, tgsRep, err := cl.TGSExchange(tgsReq, realm, messages.Ticket{}, skey, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	decPart := marshalEncKrbCredPart{
+		TicketInfo: []marshalKrbCredInfo{
+			marshalKrbCredInfo{
+				Key:       sessionKey,
+				PRealm:    tgsRep.CRealm,
+				PName:     tgsRep.CName,
+				Flags:     tgsRep.DecryptedEncPart.Flags,
+				AuthTime:  tgsRep.DecryptedEncPart.AuthTime,
+				StartTime: tgsRep.DecryptedEncPart.StartTime,
+				EndTime:   tgsRep.DecryptedEncPart.EndTime,
+				RenewTill: tgsRep.DecryptedEncPart.RenewTill,
+				SRealm:    tgsRep.DecryptedEncPart.SRealm,
+				SName:     tgsRep.DecryptedEncPart.SName,
+				CAddr:     tgsRep.DecryptedEncPart.CAddr,
+			},
+		},
+		Timestamp: time.Now(),
+	}
+
+	decPartBytes, err := asn1.Marshal(decPart)
+	if err != nil {
+		return nil, err
+	}
+
+	encPart, err := crypto.GetEncryptedData(asn1tools.AddASNAppTag(decPartBytes, asnAppTag.EncKrbCredPart), sessionKey, keyusage.KRB_CRED_ENCPART, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	ticketBytes, err := asn1.Marshal(tgsRep.Ticket)
+	if err != nil {
+		return nil, err
+	}
+
+	cred := marshalKRBCred{
+		PVNO:    iana.PVNO,
+		MsgType: msgtype.KRB_CRED,
+		Tickets: []asn1.RawValue{
+			asn1.RawValue{
+				Class:      asn1.ClassApplication,
+				Tag:        asnAppTag.Ticket,
+				IsCompound: true,
+				Bytes:      ticketBytes,
+			},
+		},
+		EncPart: encPart,
+	}
+
+	credBytes, err := asn1.Marshal(cred)
+	if err != nil {
+		return nil, err
+	}
+
+	return asn1tools.AddASNAppTag(credBytes, asnAppTag.KRBCred), nil
 }
